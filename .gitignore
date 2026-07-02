@@ -1,0 +1,19 @@
+# Never commit real/sensitive documents
+*.hwpx
+*.hwp
+*.pdf
+*.png
+*.jpg
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Work outputs
+/tests/out/
+/tests/_work/
+*.log
+_tmp*
+laid*.hwpx
+render*.pdf
