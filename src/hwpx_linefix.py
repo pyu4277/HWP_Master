@@ -102,6 +102,37 @@ def leaf_paras(sroot):
             res.append({"p": p, "own": t})
     return res
 
+# ---------------- non-destructive integrity gates (README/SKILL: text-invariant + testzip + hwpx-open) ----
+def all_text(root):
+    """Every <t> text in document order, each counted once (consistent text-invariant measure)."""
+    return "".join((t.text or "") for t in root.iter() if L(t) == "t")
+
+def section_text(hwpx):
+    with zipfile.ZipFile(hwpx) as z:
+        return all_text(etree.fromstring(z.read("Contents/section0.xml")))
+
+def integrity_check(hwpx, orig_text):
+    """Return (ok, problems[]). Enforces: zip testzip, text-invariant, hwpx openable with paras>0."""
+    problems = []
+    try:
+        if zipfile.ZipFile(hwpx).testzip() is not None:
+            problems.append("zip-testzip-failed")
+    except Exception as e:
+        problems.append("zip-open:%r" % e)
+    try:
+        if section_text(hwpx) != orig_text:
+            problems.append("text-changed")
+    except Exception as e:
+        problems.append("text-read:%r" % e)
+    try:
+        from hwpx.document import HwpxDocument
+        d = HwpxDocument.open(hwpx)
+        if sum(1 for _ in d.paragraphs) <= 0:
+            problems.append("hwpx-open-zero-paras")
+    except Exception as e:
+        problems.append("hwpx-open:%r" % e)
+    return (len(problems) == 0, problems)
+
 # ---------------- map split -> paragraph + break offset ----------------
 def map_split(split, leaves):
     a = split["head_line"].rstrip()
@@ -254,14 +285,19 @@ def para_visual_lines(para_own, all_vlines):
 def fix_document(work_hwpx, workdir, max_global=40, verbose=True):
     pdf = os.path.join(workdir, "_lf_render.pdf")
     fixed_words = 0; failed = []
+    # capture the document's text ONCE before any edit — the non-destructive invariant baseline.
+    orig_text = section_text(work_hwpx)
     for git in range(max_global):
         render_pdf(os.path.abspath(work_hwpx), os.path.abspath(pdf))
         vl = visual_lines(pdf)
         splits = detect_splits(vl)
         log("[iter %d] visual_lines=%d splits=%d" % (git, len(vl), len(splits)))
         if not splits:
-            log("[done] no split 어절 remain after %d iters, %d words fixed" % (git, fixed_words))
-            return {"clean": True, "iters": git, "fixed": fixed_words, "failed": failed}
+            ok, probs = integrity_check(work_hwpx, orig_text)
+            log("[done] no split 어절 remain after %d iters, %d words fixed | integrity=%s %s"
+                % (git, fixed_words, "PASS" if ok else "FAIL", "" if ok else probs))
+            return {"clean": True, "iters": git, "fixed": fixed_words, "failed": failed,
+                    "integrity_ok": ok, "integrity": probs}
         # load current OWPML
         with zipfile.ZipFile(work_hwpx) as z:
             names = z.namelist(); dm = {n: z.read(n) for n in names}
@@ -301,6 +337,8 @@ def fix_document(work_hwpx, workdir, max_global=40, verbose=True):
         solved = False
         for mag in (4, 8, 12, 16, 20):
             pct = sign * mag
+            # snapshot pre-edit bytes so a corrupt/text-mutating edit can be rolled back non-destructively.
+            with open(work_hwpx, "rb") as f: prev_bytes = f.read()
             # fresh load to apply cleanly each try
             with zipfile.ZipFile(work_hwpx) as z:
                 names = z.namelist(); dm2 = {n: z.read(n) for n in names}
@@ -320,6 +358,14 @@ def fix_document(work_hwpx, workdir, max_global=40, verbose=True):
                 for n in names:
                     if n == "mimetype": continue
                     zo.writestr(n, dm2[n])
+            # non-destructive gate BEFORE spending a render: reject any edit that breaks zip/text/openability.
+            ok, probs = integrity_check(work_hwpx, orig_text)
+            if not ok:
+                log("  [integrity FAIL pct=%d] %s -> rollback, skip word '%s'" % (pct, probs, word))
+                with open(work_hwpx, "wb") as f: f.write(prev_bytes)
+                failed.append({"word": word, "integrity": probs, "head": top["head_line"][-10:]})
+                solved = False
+                break
             render_pdf(os.path.abspath(work_hwpx), os.path.abspath(pdf))
             vl2 = visual_lines(pdf); sp2 = detect_splits(vl2)
             still = any((s["head_line"].rstrip()[-8:] == top["head_line"].rstrip()[-8:]) for s in sp2)
@@ -331,7 +377,9 @@ def fix_document(work_hwpx, workdir, max_global=40, verbose=True):
             failed.append({"word": word, "head": top["head_line"][-10:]})
             # to avoid infinite loop on same word, we accept current state and continue;
             # but since it re-detects top-first, mark by nudging: leave applied 20 and continue to next global iter
-    return {"clean": False, "iters": max_global, "fixed": fixed_words, "failed": failed, "reason": "max_iter"}
+    ok, probs = integrity_check(work_hwpx, orig_text)
+    return {"clean": False, "iters": max_global, "fixed": fixed_words, "failed": failed,
+            "reason": "max_iter", "integrity_ok": ok, "integrity": probs}
 
 def main():
     ap = argparse.ArgumentParser()
