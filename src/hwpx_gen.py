@@ -68,6 +68,8 @@ def prefix(text, n=24):
 def _add_body(doc, text, counter, char_pr_id_ref=None, para_pr_id_ref=None):
     """본문 문단 추가 후 (문단객체, 전역 index) 반환.
     char_pr_id_ref 를 명시(inherit_style=False)해 앞 문단(예: 제목) 스타일 상속 누수를 차단한다."""
+    if para_pr_id_ref is None:
+        para_pr_id_ref = _body_parapr(doc)  # 글자 단위 줄나눔(KEEP_WORD) — R-D 단절 유도의 전제
     p = doc.add_paragraph(text, char_pr_id_ref=char_pr_id_ref, para_pr_id_ref=para_pr_id_ref,
                           inherit_style=False)
     idx = counter[0]
@@ -86,6 +88,40 @@ def _ln(e):
 
 def _mm_to_hwpunit(mm):
     return int(round(mm * 7200 / 25.4))
+
+
+def _set_char_break(pp):
+    """paraPr 의 breakSetting 을 '글자 단위 줄나눔'으로. 렌더 실측(2026-07-03) 결과 의미가 이름과 반대:
+    KEEP_WORD = 글자 단위 나눔(단절 발생, 실물 문서 본문과 동일) / BREAK_WORD = 어절 보존(단절 없음).
+    R-D 단절 후보가 실제로 단절되려면 KEEP_WORD 가 필요하다(E57: 렌더 정본)."""
+    bs = next((x for x in pp.iter() if _ln(x) == "breakSetting"), None)
+    if bs is not None:
+        bs.set("breakNonLatinWord", "KEEP_WORD")
+
+
+_BODY_PARAPR_CACHE = {}
+
+
+def _body_parapr(doc):
+    """본문용 공유 paraPr(글자 단위 줄나눔). 기본 paraPr 0 을 clone 해 breakSetting 만 교체."""
+    key = id(doc)
+    if key in _BODY_PARAPR_CACHE:
+        return _BODY_PARAPR_CACHE[key]
+    hdr = doc.headers[0]
+    root = hdr.element
+    parapros = next(e for e in root.iter() if _ln(e) == "paraProperties")
+    base = next(e for e in parapros if _ln(e) == "paraPr")
+    pp = copy.deepcopy(base)
+    pid = str(max(int(e.get("id", "0")) for e in parapros if _ln(e) == "paraPr") + 1)
+    pp.set("id", pid)
+    _set_char_break(pp)
+    parapros.append(pp)
+    c = parapros.get("itemCnt")
+    if c is not None:
+        parapros.set("itemCnt", str(int(c) + 1))
+    hdr.mark_dirty()
+    _BODY_PARAPR_CACHE[key] = pid
+    return pid
 
 
 def _ensure_bullet_parapr(doc, first_line_mm):
@@ -119,6 +155,7 @@ def _ensure_bullet_parapr(doc, first_line_mm):
     for ch in list(pp):  # 중복 방지: 기존 heading/switch/직속 margin 제거
         if _ln(ch) in ("heading", "switch", "margin"):
             pp.remove(ch)
+    _set_char_break(pp)  # 글머리 본문도 글자 단위 줄나눔(실물 bullet paraPr 와 동일)
     hd = ET.Element("{%s}heading" % HH_NS, {"type": "BULLET", "idRef": bid, "level": "0"})
     kids = list(pp)
     ai = next((i for i, c in enumerate(kids) if _ln(c) == "align"), -1)
