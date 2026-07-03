@@ -27,10 +27,11 @@ def log(msg):
 # NOTE: reusing one HwpObject + accessing XHwpDocuments corrupts state ("RPC 서버를 사용할 수 없습니다"
 # then AttributeError('Open')). Confirmed-working pattern = fresh Dispatch + Open + SaveAs + Quit each call.
 # Do NOT access XHwpDocuments; do NOT force-kill Hwp.exe mid-run (that corrupts the COM server). See E58.
-def render_pdf(hwpx_abs, pdf_abs):
+def render_pdf(hwpx_abs, pdf_abs, _retry=True):
     import win32com.client as wc
     import pythoncom
     pythoncom.CoInitialize()
+    h = None
     try:
         h = wc.Dispatch("HWPFrame.HwpObject")
         try: h.RegisterModule("FilePathCheckDLL", "AutomationModule")
@@ -46,6 +47,17 @@ def render_pdf(hwpx_abs, pdf_abs):
             time.sleep(0.1)
         try: h.Quit()
         except Exception: pass
+    except Exception:
+        # E58 보강(2026-07-03 실측): 직전 렌더의 Quit 미완 상태에서 무간격 재호출 시 Open 간헐 실패.
+        # 짧은 백오프 후 fresh Dispatch 1회 재시도(계획 R1). 재실패 시 표면화(호출자 처리).
+        try:
+            if h is not None: h.Quit()
+        except Exception:
+            pass
+        if _retry:
+            time.sleep(2.0)
+            return render_pdf(hwpx_abs, pdf_abs, _retry=False)
+        raise
     finally:
         pythoncom.CoUninitialize()
     return pdf_abs

@@ -91,6 +91,8 @@ def run(workdir, manifest_path, review_only=False, max_rounds=8):
                 % (doc, a2, "PASS" if a3_ok else "FAIL",
                    "n/a" if a4_ok is None else ("splits=%d" % a4_rep.get("count", -1)),
                    "CLEAN" if clean else "DIRTY"))
+            if a4_ok is None and not review_only:
+                log("  [A4 error] %s" % a4_rep.get("error", a4_rep))
             if not a3_ok: log(a3_txt)
             if not clean: round_clean = False
 
