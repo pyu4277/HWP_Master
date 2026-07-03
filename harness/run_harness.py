@@ -43,8 +43,10 @@ def a2_fix(src_hwpx, fixed_hwpx, review_only=False):
     if review_only:
         return {"rd": "skipped(review-only)"}
     # R-D 렌더-루프 (로컬 COM) — 파일 in-place 수정
+    # encoding 명시: 자식(linefix)은 UTF-8 출력 — text=True(로케일 cp949 디코드)면 한글 로그에서
+    # UnicodeDecodeError 로 하네스가 죽거나 행(2026-07-03 플릿 크래시 실측). errors=replace 로 방어.
     r = subprocess.run([PY, os.path.join(SRC, "hwpx_linefix.py"), fixed_hwpx],
-                       capture_output=True, text=True)
+                       capture_output=True, encoding="utf-8", errors="replace")
     return {"rd_rc": r.returncode, "rd_tail": r.stdout.strip().splitlines()[-1:] if r.stdout else []}
 
 
