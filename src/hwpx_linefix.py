@@ -27,10 +27,11 @@ def log(msg):
 # NOTE: reusing one HwpObject + accessing XHwpDocuments corrupts state ("RPC 서버를 사용할 수 없습니다"
 # then AttributeError('Open')). Confirmed-working pattern = fresh Dispatch + Open + SaveAs + Quit each call.
 # Do NOT access XHwpDocuments; do NOT force-kill Hwp.exe mid-run (that corrupts the COM server). See E58.
-def render_pdf(hwpx_abs, pdf_abs):
+def render_pdf(hwpx_abs, pdf_abs, _retry=True):
     import win32com.client as wc
     import pythoncom
     pythoncom.CoInitialize()
+    h = None
     try:
         h = wc.Dispatch("HWPFrame.HwpObject")
         try: h.RegisterModule("FilePathCheckDLL", "AutomationModule")
@@ -46,6 +47,17 @@ def render_pdf(hwpx_abs, pdf_abs):
             time.sleep(0.1)
         try: h.Quit()
         except Exception: pass
+    except Exception:
+        # E58 보강(2026-07-03 실측): 직전 렌더의 Quit 미완 상태에서 무간격 재호출 시 Open 간헐 실패.
+        # 짧은 백오프 후 fresh Dispatch 1회 재시도(계획 R1). 재실패 시 표면화(호출자 처리).
+        try:
+            if h is not None: h.Quit()
+        except Exception:
+            pass
+        if _retry:
+            time.sleep(2.0)
+            return render_pdf(hwpx_abs, pdf_abs, _retry=False)
+        raise
     finally:
         pythoncom.CoUninitialize()
     return pdf_abs
@@ -102,11 +114,44 @@ def leaf_paras(sroot):
             res.append({"p": p, "own": t})
     return res
 
+# ---------------- non-destructive integrity gates (README/SKILL: text-invariant + testzip + hwpx-open) ----
+def all_text(root):
+    """Every <t> text in document order, each counted once (consistent text-invariant measure)."""
+    return "".join((t.text or "") for t in root.iter() if L(t) == "t")
+
+def section_text(hwpx):
+    with zipfile.ZipFile(hwpx) as z:
+        return all_text(etree.fromstring(z.read("Contents/section0.xml")))
+
+def integrity_check(hwpx, orig_text):
+    """Return (ok, problems[]). Enforces: zip testzip, text-invariant, hwpx openable with paras>0."""
+    problems = []
+    try:
+        if zipfile.ZipFile(hwpx).testzip() is not None:
+            problems.append("zip-testzip-failed")
+    except Exception as e:
+        problems.append("zip-open:%r" % e)
+    try:
+        if section_text(hwpx) != orig_text:
+            problems.append("text-changed")
+    except Exception as e:
+        problems.append("text-read:%r" % e)
+    try:
+        from hwpx.document import HwpxDocument
+        d = HwpxDocument.open(hwpx)
+        if sum(1 for _ in d.paragraphs) <= 0:
+            problems.append("hwpx-open-zero-paras")
+    except Exception as e:
+        problems.append("hwpx-open:%r" % e)
+    return (len(problems) == 0, problems)
+
 # ---------------- map split -> paragraph + break offset ----------------
 def map_split(split, leaves):
     a = split["head_line"].rstrip()
     b = split["tail_line"]
-    for K in (14, 10, 7, 5):
+    # 큰 창 우선: 같은 긴 어절이 문서에 중복 등장할 때, 단절이 어절 내부 깊숙이면 작은 창은
+    # 어절 안 글자만 덮어 두 사본을 구분 못함(모호->unmappable). 28자 창은 어절 밖 문맥 포함(2026-07-03).
+    for K in (28, 22, 16, 12, 8, 5):
         ha, hb = a[-K:], b[:K]
         key = ha + hb
         hits = [(lf, lf["own"].find(key)) for lf in leaves if key and lf["own"].find(key) >= 0]
@@ -251,87 +296,175 @@ def para_visual_lines(para_own, all_vlines):
     return texts
 
 # ---------------- main fix loop ----------------
+SPACING_MAGS = (4, 8, 12, 16, 20)
+EXC_MAGS = (24, 28, 32, 36)  # 육안 예외 사다리(스펙: 하한 기본 -20%, 육안 예외 허용) — 양방향 소진 후 narrow 전용
+
+def split_key(s):
+    return (s["head_line"].rstrip()[-8:], s["tail_line"][:8])
+
 def fix_document(work_hwpx, workdir, max_global=40, verbose=True):
+    """loop-until-clean. iter 마다: 렌더 -> 단절 탐지 -> (문단당 1건) 배치 자간 적용 -> 무결성 -> 재렌더.
+    - unmappable(표 인접 셀 등 fitz 거짓양성 / map_split 실패)은 skip-set 으로 격리해 진행을 막지 않는다.
+      (2026-07-03 실측: 표 헤더 셀 '학습 영역'|'학습 요소' 가 같은 fitz 블록의 연속 줄로 잡혀
+       거짓양성 — 본문 문단에 이어붙인 키가 없으므로 map_split 실패가 곧 정확한 필터.)
+    - 어절별 자간 사다리(SPACING_MAGS) 상태를 유지, 다음 iter 렌더에서 여전히 단절이면 한 단계 에스컬레이션.
+      배치(문단당 1건) + iter 당 렌더 1회로 재렌더 횟수 축소(R2 병목완화). 같은 문단 복수 단절은
+      앞 조절이 뒤 줄바꿈을 바꾸므로 다음 iter 로 순연(위->아래 순차 원칙 유지).
+    - clean = skip 제외 단절 0. skipped/failed 는 결과에 별도 보고(무언 truncation 금지)."""
     pdf = os.path.join(workdir, "_lf_render.pdf")
     fixed_words = 0; failed = []
+    skip_raw = set()  # 단절-텍스트 키: unmappable(표 셀 등 거짓양성) 영구 격리
+    skip_mk = set()   # 어절 키(문단 프리픽스, 어절 시작 오프셋): 사다리 소진 / 진동 / 롤백 격리
+    active = {}       # 어절 키 -> 다음 시도 사다리 인덱스
+    wordof = {}       # 어절 키 -> 어절 텍스트(보고용)
+    magmem = {}       # 어절 키 -> 해소 시점 사다리 인덱스(재발 시 이어감 — 재시작 금지)
+    everfixed = {}    # 어절 키 -> 해소 횟수(재발/진동 감시)
+    # 어절 키를 단절-텍스트가 아닌 (문단, 오프셋)으로 잡는 이유(2026-07-03 진동 근본원인):
+    # 단절 지점이 드리프트하면 텍스트 키는 새 어절로 오인 -> 사다리 -4 재시작이 기존 강한 자간(-20)을
+    # 절대값으로 덮어써 회귀 -> 무한 진동. 텍스트 불변이라 (문단 프리픽스, 어절 시작)은 항상 안정.
+    orig_text = section_text(work_hwpx)
     for git in range(max_global):
         render_pdf(os.path.abspath(work_hwpx), os.path.abspath(pdf))
         vl = visual_lines(pdf)
         splits = detect_splits(vl)
-        log("[iter %d] visual_lines=%d splits=%d" % (git, len(vl), len(splits)))
-        if not splits:
-            log("[done] no split 어절 remain after %d iters, %d words fixed" % (git, fixed_words))
-            return {"clean": True, "iters": git, "fixed": fixed_words, "failed": failed}
-        # load current OWPML
+        # 현재 OWPML 로드 + 전 단절 매핑(안정 어절 키 산출)
         with zipfile.ZipFile(work_hwpx) as z:
             names = z.namelist(); dm = {n: z.read(n) for n in names}
         sroot = etree.fromstring(dm["Contents/section0.xml"])
         hroot = etree.fromstring(dm["Contents/header.xml"])
         cidx = charpr_index(hroot); cache = {}
         leaves = leaf_paras(sroot)
-        # take the TOP split, map, fix
-        top = splits[0]
-        para, own, boff = map_split(top, leaves)
-        if para is None:
-            log("  [skip] cannot map split: %r|%r" % (top["head_line"][-10:], top["tail_line"][:10]))
-            failed.append(top);
-            # try next splits by removing this one visually is hard; abort to avoid loop
-            if len(splits) == 1:
-                return {"clean": False, "iters": git, "fixed": fixed_words, "failed": failed, "reason": "unmappable"}
-            # crude: try second split
-            top = splits[1]; para, own, boff = map_split(top, leaves)
+        mapped = []; cur_mks = set(); n_skipped = 0
+        for s in splits:
+            rk = split_key(s)
+            if rk in skip_raw:
+                n_skipped += 1
+                continue
+            para, own, boff = map_split(s, leaves)
             if para is None:
-                return {"clean": False, "iters": git, "fixed": fixed_words, "failed": failed, "reason": "unmappable2"}
-        # geometry
-        pv = para_visual_lines(own, vl)
-        breaks = para_break_offsets(own, pv) if pv else [boff]
-        if boff not in breaks: breaks = sorted(set(breaks + [boff]))
-        lstart = line_start_offset(own, boff, breaks)
-        lstart = skip_bullet(own, lstart)
-        ls, le = word_bounds(own, boff)
-        head_len, tail_len = boff - ls, le - boff
-        if head_len < tail_len:
-            direction = "widen"; span_s, span_e = lstart, ls; sign = +1
-        else:
-            direction = "narrow"; span_s, span_e = lstart, le; sign = -1
-        if span_e <= span_s:
-            span_s, span_e = lstart, le; sign = -1; direction = "narrow(fallback)"
-        # magnitude search: apply increasing |pct| up to 20, re-render, re-check this word
-        word = own[ls:le]
-        solved = False
-        for mag in (4, 8, 12, 16, 20):
-            pct = sign * mag
-            # fresh load to apply cleanly each try
-            with zipfile.ZipFile(work_hwpx) as z:
-                names = z.namelist(); dm2 = {n: z.read(n) for n in names}
-            sr = etree.fromstring(dm2["Contents/section0.xml"])
-            hr = etree.fromstring(dm2["Contents/header.xml"])
-            ci = charpr_index(hr); ca = {}
-            lv = leaf_paras(sr)
-            pp2, own2, boff2 = map_split(top, lv)
-            if pp2 is None: break
-            apply_span_spacing(pp2, hr, span_s, span_e, pct, ci, ca)
-            dm2["Contents/section0.xml"] = etree.tostring(sr, xml_declaration=True, encoding="UTF-8", standalone=True)
-            dm2["Contents/header.xml"] = etree.tostring(hr, xml_declaration=True, encoding="UTF-8", standalone=True)
-            with zipfile.ZipFile(work_hwpx, "w", zipfile.ZIP_DEFLATED) as zo:
-                if "mimetype" in dm2:
-                    zi = zipfile.ZipInfo("mimetype"); zi.compress_type = zipfile.ZIP_STORED
-                    zo.writestr(zi, dm2["mimetype"])
-                for n in names:
-                    if n == "mimetype": continue
-                    zo.writestr(n, dm2[n])
-            render_pdf(os.path.abspath(work_hwpx), os.path.abspath(pdf))
-            vl2 = visual_lines(pdf); sp2 = detect_splits(vl2)
-            still = any((s["head_line"].rstrip()[-8:] == top["head_line"].rstrip()[-8:]) for s in sp2)
-            log("  [%s pct=%d] word='%s' still_split=%s (total splits %d)" % (direction, pct, word, still, len(sp2)))
-            if not still:
-                solved = True; fixed_words += 1; break
-        if not solved:
-            log("  [fail] could not resolve '%s' within +-20; leaving and moving on" % word)
-            failed.append({"word": word, "head": top["head_line"][-10:]})
-            # to avoid infinite loop on same word, we accept current state and continue;
-            # but since it re-detects top-first, mark by nudging: leave applied 20 and continue to next global iter
-    return {"clean": False, "iters": max_global, "fixed": fixed_words, "failed": failed, "reason": "max_iter"}
+                skip_raw.add(rk); n_skipped += 1
+                failed.append({"unmappable": "%s|%s" % (s["head_line"][-10:], s["tail_line"][:10])})
+                log("  [skip-unmappable] %r|%r (표 셀 등 거짓양성 추정)"
+                    % (s["head_line"][-10:], s["tail_line"][:10]))
+                continue
+            ls, le = word_bounds(own, boff)
+            mk = (own[:16], ls)
+            if mk in skip_mk:
+                n_skipped += 1
+                continue
+            cur_mks.add(mk)
+            mapped.append({"para": para, "own": own, "boff": boff, "ls": ls, "le": le, "mk": mk})
+        # 직전 iter 에 시도한 어절이 이번 렌더에서 사라졌으면 해소된 것(렌더 실측 기준).
+        for k in [k for k in list(active) if k not in cur_mks]:
+            fixed_words += 1
+            everfixed[k] = everfixed.get(k, 0) + 1
+            magmem[k] = active[k]
+            log("  [fixed] word='%s'%s" % (wordof.get(k, "?"),
+                "" if everfixed[k] == 1 else " (재발해소 x%d)" % everfixed[k]))
+            del active[k]
+        pending = mapped
+        log("[iter %d] visual_lines=%d splits=%d pending=%d skipped=%d fixed=%d"
+            % (git, len(vl), len(splits), len(pending), n_skipped, fixed_words))
+        if not pending:
+            ok, probs = integrity_check(work_hwpx, orig_text)
+            log("[done] no actionable split after %d iters | fixed=%d residual_skipped=%d | integrity=%s %s"
+                % (git, fixed_words, len(splits), "PASS" if ok else "FAIL", "" if ok else probs))
+            return {"clean": True, "iters": git, "fixed": fixed_words,
+                    "unique_fixed": len(everfixed), "failed": failed,
+                    "residual_skipped": len(splits), "integrity_ok": ok, "integrity": probs}
+        # 배치 구성: 문단당 1건 (매핑·격리는 위에서 완료).
+        batch = []; used = set()
+        for m in pending:
+            k = m["mk"]; para = m["para"]; own = m["own"]
+            boff = m["boff"]; ls = m["ls"]; le = m["le"]
+            if id(para) in used: continue
+            # 진동(고침<->재발 반복) 어절: 4회 이상 재발이면 격리 보고(무한 밀당 차단).
+            if everfixed.get(k, 0) >= 4:
+                skip_mk.add(k); active.pop(k, None)
+                failed.append({"word": wordof.get(k, "?"), "reason": "oscillating"})
+                log("  [fail] '%s' 진동(고침-재발 4회) — 격리 후 계속" % wordof.get(k, "?"))
+                continue
+            NM = len(SPACING_MAGS); NEXC = len(EXC_MAGS)
+            mi = active.get(k, magmem.get(k, 0))  # 재발 시 지난 사다리에서 이어감(재시작 금지)
+            if mi >= 2 * NM + NEXC:
+                skip_mk.add(k); active.pop(k, None)
+                failed.append({"word": wordof.get(k, own[max(0, boff - 8):boff + 8]),
+                               "reason": "max-magnitude-incl-exception"})
+                log("  [fail] '%s' 양방향+예외 사다리 소진(-28까지) — 격리 후 계속" % wordof.get(k, "?"))
+                continue
+            phase, step = divmod(min(mi, 2 * NM - 1), NM)  # phase 0 = 자연 / 1 = 반대 폴백 / (mi>=2NM = 예외)
+            pv = para_visual_lines(own, vl)
+            breaks = para_break_offsets(own, pv) if pv else [boff]
+            if boff not in breaks: breaks = sorted(set(breaks + [boff]))
+            lstart = skip_bullet(own, line_start_offset(own, boff, breaks))
+            head_len, tail_len = boff - ls, le - boff
+            if head_len < tail_len:
+                direction = "widen"; span_s, span_e = lstart, ls; sign = +1
+            else:
+                direction = "narrow"; span_s, span_e = lstart, le; sign = -1
+            if span_e <= span_s:
+                direction = "narrow(fallback)"; span_s, span_e = lstart, le; sign = -1
+            if phase == 0 and everfixed.get(k, 0) >= 2 and sign > 0:
+                # 재발 2회+ 어절은 narrow 고정(같은 문단 widen<->narrow 밀당 진동 차단).
+                direction = "narrow(osc)"; span_s, span_e = lstart, le; sign = -1
+            undo_span = None
+            if mi >= 2 * NM:
+                # 육안 예외 사다리(-24, -28): 기하상 +-20 으로 불가한 극단 어절(스펙 예외 조항).
+                pct = -EXC_MAGS[mi - 2 * NM]
+                direction = "narrow(육안예외)"; span_s, span_e = lstart, le
+            else:
+                if phase == 1:
+                    # 한 방향 사다리 소진 -> 반대 방향 폴백(사용자 규칙2: 상황별 n/w 최적).
+                    # 예: narrow 로 못 잇는 어절은 widen 으로 어절 전체를 다음 줄로 내려 안정화.
+                    if sign < 0:
+                        direction = "widen(반대폴백)"; span_s, span_e = lstart, ls; sign = +1
+                    else:
+                        direction = "narrow(반대폴백)"; span_s, span_e = lstart, le; sign = -1
+                    if span_e <= span_s:
+                        skip_mk.add(k); active.pop(k, None)
+                        failed.append({"word": own[ls:le], "reason": "no-fallback-span"})
+                        log("  [fail] '%s' 반대방향 스팬 없음 — 격리 후 계속" % own[ls:le])
+                        continue
+                    if step == 0:
+                        undo_span = (lstart, le)  # 이전 방향 자간을 절대값 0 으로 원복 후 반대 방향 시작
+                pct = sign * SPACING_MAGS[step]
+            word = own[ls:le]; wordof[k] = word
+            batch.append({"k": k, "mi": mi, "para": para, "s": span_s, "e": span_e,
+                          "pct": pct, "word": word, "dir": direction,
+                          "undo": undo_span})
+            used.add(id(para))
+        if not batch:
+            continue  # 이번 iter 전원 격리됨 -> 다음 iter 선두 렌더에서 pending 재평가(대개 즉시 done)
+        # 배치 적용 -> repack -> 무결성 게이트(렌더 소모 전) -> 실패 시 iter 통째 롤백.
+        with open(work_hwpx, "rb") as f: prev_bytes = f.read()
+        for b in batch:
+            if b.get("undo"):
+                apply_span_spacing(b["para"], hroot, b["undo"][0], b["undo"][1], 0, cidx, cache)
+                log("  [undo->0] word='%s' (반대방향 전환 전 원복)" % b["word"])
+            apply_span_spacing(b["para"], hroot, b["s"], b["e"], b["pct"], cidx, cache)
+            active[b["k"]] = b["mi"] + 1  # 사다리 전진(재발 이어가기 포함)
+            log("  [%s pct=%+d] word='%s'" % (b["dir"], b["pct"], b["word"]))
+        dm["Contents/section0.xml"] = etree.tostring(sroot, xml_declaration=True, encoding="UTF-8", standalone=True)
+        dm["Contents/header.xml"] = etree.tostring(hroot, xml_declaration=True, encoding="UTF-8", standalone=True)
+        with zipfile.ZipFile(work_hwpx, "w", zipfile.ZIP_DEFLATED) as zo:
+            if "mimetype" in dm:
+                zi = zipfile.ZipInfo("mimetype"); zi.compress_type = zipfile.ZIP_STORED
+                zo.writestr(zi, dm["mimetype"])
+            for n in names:
+                if n == "mimetype": continue
+                zo.writestr(n, dm[n])
+        ok, probs = integrity_check(work_hwpx, orig_text)
+        if not ok:
+            log("  [integrity FAIL] %s -> iter 통째 롤백·해당 어절 격리" % probs)
+            with open(work_hwpx, "wb") as f: f.write(prev_bytes)
+            for b in batch:
+                skip_mk.add(b["k"]); active.pop(b["k"], None)
+                failed.append({"word": b["word"], "integrity": probs})
+        # 검증 렌더는 다음 iter 선두에서 1회 수행(iter 당 렌더 1회).
+    ok, probs = integrity_check(work_hwpx, orig_text)
+    return {"clean": False, "iters": max_global, "fixed": fixed_words,
+            "unique_fixed": len(everfixed), "failed": failed,
+            "reason": "max_iter", "integrity_ok": ok, "integrity": probs}
 
 def main():
     ap = argparse.ArgumentParser()

@@ -1,0 +1,13 @@
+# hwpx-master-harness dependencies (python 3.12)
+#
+# 실행 환경 주의:
+#   - lxml, PyMuPDF, hwpx  => 크로스플랫폼(합성 생성기 hwpx_gen.py, 코드리뷰 등 COM-비의존 부분).
+#   - pywin32              => Windows 전용. R-D 렌더-인-루프(hwpx_linefix.py)와 비전 렌더는
+#                             로컬 Windows + Hancom Office 2024(COM)에서만 동작. 클라우드/리눅스 설치 불필요.
+
+lxml>=5.0
+PyMuPDF>=1.24          # import fitz
+hwpx>=0.4              # python-hwpx: HwpxDocument.open / 무결성·합성 생성
+
+# Windows-only (COM 렌더). 리눅스/클라우드에서는 설치 생략 가능:
+pywin32>=306 ; sys_platform == "win32"

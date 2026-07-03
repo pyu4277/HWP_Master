@@ -38,9 +38,13 @@ HWPX(아래아한글 OWPML) 본문 미세정렬 규칙을 **절대 실수 없이
 
 ## 코드 상태
 
+규칙 정본 스펙은 [`SKILL.md`](SKILL.md)로 이관(단일 근거). 이 README 는 배경·제약 요약.
+
 - `src/hwpx_microalign.py` — R-A/R-B(+R-C flag) 검증 완료(독립 verifier: ground truth 15/15 일치, 멱등성·텍스트불변·무결성 PASS).
 - `src/hwpx_fill_lib.py` — 재사용 OWPML 헬퍼(load_section/serialize/repack/run·paraPr 조작).
-- **구축 예정**: `src/hwpx_linefix.py`(R-D 렌더-인-루프 엔진), `harness/`(자가개선 하네스).
+- `src/hwpx_linefix.py` — **R-D 렌더-인-루프 엔진 구현 완료**. fresh-Dispatch 개정판 완주 검증 대기(E58 관문, 로컬 전용). 텍스트불변·testzip·hwpx-open 무결성 게이트 포함.
+- `src/hwpx_gen.py` — 표·캡션·주석 포함 난잡 합성 문서 생성기(+manifest).
+- `harness/` — 5 에이전트 자가개선 하네스(생성/독립수정/코드리뷰/비전/자기수정, loop-until-dry).
 
 ## 자가개선 하네스 (구축 대상)
 
