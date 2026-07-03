@@ -195,6 +195,30 @@ self-verifying 하네스를 구축하는 것이다.
 
 ---
 
+## 진행 상태 (2026-07-03 갱신 — Phase 1 통과)
+
+- **Phase 1 완료 (LOCAL, E58 관문 통과)**: 실물 문서(전기기초실습 4.4MB, 1058 시각줄)에서
+  렌더-루프 36 iter 완주(189s), **clean=True · unique_fixed=107 어절 · 무결성 3종 PASS · E58 0회**(~96 렌더).
+  before 137 -> after 62 단절(잔여 62 = 표 셀/수식 거짓양성 60 + 진동 격리 2 — failed 로 정직 보고).
+  before/after 렌더 PNG 육안 대조로 "등의·사용법을·저항의·임피던스의" 등 1줄화 확인.
+- **Phase 1 중 발견·자가수정한 결함 5건** (자기수정 게이트: 엔진/도구 = 자동):
+  1. `hwpx_gen.py` `ensure_run_style(size=)` — 로컬 hwpx 2.9 미지원 -> `ensure_char_property`(height twin) 로 교체.
+  2. `hwpx_gen.py` `set_list_format`/`set_paragraph_format` — 2.9 부재 -> 실물 paraPr 구조(heading BULLET +
+     hp:switch case/default margin intent) 직접 주입(`_ensure_bullet_parapr`). microalign R-A 발화+함정 불가침 검증.
+  3. python-hwpx `header.element` 는 type hint(ET)와 달리 **lxml** — 생성기 임포트 정합.
+  4. `hwpx_linefix.py` unmappable 2회 후 전체 포기 -> **skip-set 격리 + 문단당 1건 배치 + iter 당 렌더 1회**
+     (표 셀 거짓양성 61건이 진행을 막던 결함 해소, R2 병목완화 동시 반영).
+  5. 같은 문단 widen<->narrow 밀당 **진동** -> 사다리 기억(재발 시 이어감) + 재발 2회 narrow 고정 +
+     4회 격리. max_iter 발산이 clean 수렴으로 전환.
+- **알려진 잔여(비차단, A5 백로그)**: (a) 수식 개체 인접 단절 4건 unmappable(PDF 텍스트!=OWPML 텍스트),
+  (b) 진동 미해소 2어절(장비의·멀티미터·전원 — 문단 재배치 전략 필요), (c) 연속 renders 무간격 시
+  간헐 COM Open 실패(엔진 루프는 자연 간격으로 무영향; R1 백오프 재시도 추가 후보),
+  (d) minimal-split 합성문서가 비정상 협폭 렌더(생성기 페이지 셋업 부재 — messy 프로파일/실물로 대체).
+- **다음 = Phase 2 파일럿**: messy 3~5문서(생성기 검증 완료: R-A 3·R-B 1·R-D 후보 6·함정 6,
+  microalign VERDICT PASS) -> 5-에이전트 파이프라인 1라운드.
+
+---
+
 ## 진행 상태 (2026-07-02 갱신)
 
 - **Phase 0 완료·커밋됨**: 브랜치 `feat/harness-scaffold`, 커밋 `b0df6c6`

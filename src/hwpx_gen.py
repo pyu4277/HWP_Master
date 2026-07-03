@@ -20,7 +20,8 @@ CLI:
 출력물 *.hwpx 는 gitignore 대상(생성기 코드만 커밋, 문서는 로컬 재생성).
 COM 불필요(순수 합성) — 클라우드/리눅스에서도 실행 가능.
 """
-import sys, os, json, argparse, random, logging, warnings
+import sys, os, json, argparse, random, logging, warnings, copy
+from lxml import etree as ET  # python-hwpx header.element 는 lxml (type hint 는 ET 지만 실체 lxml — 실측)
 
 # python-hwpx 의 파트-탐색 정보 로그를 조용히(생성엔 무해).
 logging.getLogger("hwpx").setLevel(logging.ERROR)
@@ -74,21 +75,97 @@ def _add_body(doc, text, counter, char_pr_id_ref=None, para_pr_id_ref=None):
     return p, idx
 
 
+HH_NS = "http://www.hancom.co.kr/hwpml/2011/head"
+HP_NS = "http://www.hancom.co.kr/hwpml/2011/paragraph"
+HC_NS = "http://www.hancom.co.kr/hwpml/2011/core"
+
+
+def _ln(e):
+    return e.tag.rsplit("}", 1)[-1]
+
+
+def _mm_to_hwpunit(mm):
+    return int(round(mm * 7200 / 25.4))
+
+
+def _ensure_bullet_parapr(doc, first_line_mm):
+    """자동 글머리 paraPr 를 실물(한/글 제작 문서) 구조 그대로 주입해 그 id 를 반환한다.
+    hwpx 2.9 에는 set_list_format/set_paragraph_format 이 없어(로컬 실측) header XML 을 직접 구성:
+      heading type=BULLET idRef=<bullet> + hp:switch(case/default) 안 hh:margin > hc:intent.
+    rule_a 탐지 요건(case/default 내 margin>intent)과 한/글 렌더 호환을 동시에 충족.
+    first_line_mm<0 => 음수 내어쓰기(R-A 대상), >0 => 양수 들여쓰기(R-A 함정)."""
+    hdr = doc.headers[0]
+    root = hdr.element
+    reflist = next(e for e in root.iter() if _ln(e) == "refList")
+    parapros = next(e for e in root.iter() if _ln(e) == "paraProperties")
+    # 1) bullet 정의(bullets 컨테이너가 없으면 paraProperties 앞에 생성 — refList 스키마 순서)
+    bullets = next((e for e in root.iter() if _ln(e) == "bullets"), None)
+    if bullets is None:
+        bullets = ET.Element("{%s}bullets" % HH_NS, {"itemCnt": "0"})
+        reflist.insert(list(reflist).index(parapros), bullets)
+    bid = str(max([int(b.get("id", "0")) for b in bullets] + [0]) + 1)
+    bu = ET.SubElement(bullets, "{%s}bullet" % HH_NS,
+                       {"id": bid, "char": "●" if first_line_mm < 0 else "○", "useImage": "0"})
+    ET.SubElement(bu, "{%s}paraHead" % HH_NS,
+                  {"level": "0", "align": "LEFT", "useInstWidth": "0", "autoIndent": "1",
+                   "widthAdjust": "0", "textOffsetType": "PERCENT", "textOffset": "50",
+                   "numFormat": "DIGIT", "charPrIDRef": "4294967295", "checkable": "0"})
+    bullets.set("itemCnt", str(len(list(bullets))))
+    # 2) 기존 paraPr 를 clone 해 heading + switch(margin intent) 주입
+    base = next(e for e in parapros if _ln(e) == "paraPr")
+    pp = copy.deepcopy(base)
+    pid = str(max(int(e.get("id", "0")) for e in parapros if _ln(e) == "paraPr") + 1)
+    pp.set("id", pid)
+    for ch in list(pp):  # 중복 방지: 기존 heading/switch/직속 margin 제거
+        if _ln(ch) in ("heading", "switch", "margin"):
+            pp.remove(ch)
+    hd = ET.Element("{%s}heading" % HH_NS, {"type": "BULLET", "idRef": bid, "level": "0"})
+    kids = list(pp)
+    ai = next((i for i, c in enumerate(kids) if _ln(c) == "align"), -1)
+    pp.insert(ai + 1, hd)  # 실물 순서: align, heading, breakSetting, ...
+    iv = str(_mm_to_hwpunit(first_line_mm))
+    lv = str(_mm_to_hwpunit(abs(first_line_mm)))
+    sw = ET.Element("{%s}switch" % HP_NS)
+    for tag, attrs in (("case", {"{%s}required-namespace" % HP_NS:
+                                 "http://www.hancom.co.kr/hwpml/2016/HwpUnitChar"}),
+                       ("default", {})):
+        blk = ET.SubElement(sw, "{%s}%s" % (HP_NS, tag), attrs)
+        mg = ET.SubElement(blk, "{%s}margin" % HH_NS)
+        for nm, val in (("intent", iv), ("left", lv), ("right", "0"), ("prev", "0"), ("next", "0")):
+            ET.SubElement(mg, "{%s}%s" % (HC_NS, nm), {"value": val, "unit": "HWPUNIT"})
+        ET.SubElement(blk, "{%s}lineSpacing" % HH_NS,
+                      {"type": "PERCENT", "value": "130", "unit": "HWPUNIT"})
+    kids = list(pp)
+    bi = next((i for i, c in enumerate(kids) if _ln(c) == "border"), len(kids))
+    pp.insert(bi, sw)  # 실물 순서: ... autoSpacing, switch, border
+    parapros.append(pp)
+    c = parapros.get("itemCnt")
+    if c is not None:
+        parapros.set("itemCnt", str(int(c) + 1))
+    hdr.mark_dirty()
+    return pid
+
+
 def _add_bullet_group(doc, texts, counter, first_line_mm, body_style):
     """자동 글머리 그룹을 '하나의 공유 paraPr'로 생성(rule_a 의 >=2 멤버 그룹 요건 충족).
-    첫 문단을 서식 지정 후 그 paraPrIDRef 를 나머지 형제 문단이 재사용한다.
     first_line_mm<0 => 음수 내어쓰기(R-A 대상), >0 => 양수 들여쓰기(R-A 함정)."""
+    ppid = _ensure_bullet_parapr(doc, first_line_mm)
     idxs = []
-    _, i0 = _add_body(doc, texts[0], counter, char_pr_id_ref=body_style)
-    idxs.append(i0)
-    bch = "●" if first_line_mm < 0 else "○"
-    doc.set_list_format(paragraph_indexes=[i0], kind="bullet", level=1, bullet_char=bch)
-    doc.set_paragraph_format(paragraph_indexes=[i0], first_line_indent_mm=first_line_mm, indent_left_mm=8.0)
-    ppid = list(doc.paragraphs)[i0].para_pr_id_ref  # 공유 paraPrIDRef
-    for t in texts[1:]:
+    for t in texts:
         _, ix = _add_body(doc, t, counter, char_pr_id_ref=body_style, para_pr_id_ref=ppid)
         idxs.append(ix)
     return idxs
+
+
+def _style_with_height(doc, height):
+    """height(1/100pt) 지정 charPr id 확보. hwpx 2.9 ensure_run_style 은 size 미지원(로컬 실측)이라
+    header.ensure_char_property(predicate/modifier)로 기존 charPr 를 클론해 height 만 바꾼 쌍둥이를 만든다."""
+    hdr = doc.headers[0]
+    el = hdr.ensure_char_property(
+        predicate=lambda e: e.get("height") == str(height),
+        modifier=lambda e: e.set("height", str(height)),
+    )
+    return el.get("id")
 
 
 def build_doc(rng, profile):
@@ -99,8 +176,8 @@ def build_doc(rng, profile):
 
     # 본문 최빈 스타일(11pt=height1100)과 제목 스타일(24pt=height2400)을 명시적으로 분리한다.
     # (add_paragraph 는 기본적으로 앞 문단 스타일을 상속하므로, 본문엔 body_style 을 강제 지정.)
-    body_style = doc.ensure_run_style(size=11, bold=False)
-    title_style = doc.ensure_run_style(size=24, bold=False)
+    body_style = _style_with_height(doc, 1100)   # 11pt
+    title_style = _style_with_height(doc, 2400)  # 24pt
 
     # 제목: 본문과 다른 큰 스타일 + 선두 괄호 => R-B 함정(스타일 불일치로 배제되어야).
     ttl = "(%s) %s 실습 결과 보고서" % (rng.choice(SUBJECTS), rng.choice(TOPICS))
